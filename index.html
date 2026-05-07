@@ -1,0 +1,816 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <meta name="theme-color" content="#8fd6ff">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="おとタッチ">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>Touch Sound Garden</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="apple-touch-icon" href="icon-192.png">
+  <style>
+    :root {
+      color-scheme: light;
+      --sky: #8fd6ff;
+      --mint: #9af0c8;
+      --peach: #ffb38a;
+      --lemon: #ffe66f;
+      --berry: #ff6f91;
+      --ink: #17324d;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      overscroll-behavior: none;
+      background: #8fd6ff;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-touch-callout: none;
+    }
+
+    body {
+      position: fixed;
+      inset: 0;
+    }
+
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      cursor: pointer;
+      touch-action: none;
+    }
+
+    .quiet-label {
+      position: fixed;
+      left: max(14px, env(safe-area-inset-left));
+      bottom: max(12px, env(safe-area-inset-bottom));
+      padding: 8px 12px;
+      border-radius: 8px;
+      color: rgba(23, 50, 77, 0.72);
+      background: rgba(255, 255, 255, 0.34);
+      backdrop-filter: blur(8px);
+      font-size: clamp(12px, 2.6vw, 15px);
+      line-height: 1.2;
+      pointer-events: none;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .quiet-label {
+        backdrop-filter: none;
+      }
+    }
+  </style>
+</head>
+<body>
+  <canvas id="stage" aria-label="touch sound play area"></canvas>
+  <div class="quiet-label" aria-hidden="true">♪</div>
+
+  <script>
+    (() => {
+      "use strict";
+
+      const canvas = document.getElementById("stage");
+      const ctx = canvas.getContext("2d", { alpha: false });
+      const TAU = Math.PI * 2;
+      const DPR_LIMIT = 2;
+      const activePointers = new Map();
+      const ripples = [];
+      const bubbles = [];
+      const notes = [];
+      const stars = [];
+      const confetti = [];
+      const rollingMelons = [];
+      const soundLoops = new Map();
+      const colors = ["#ff6f91", "#ffd166", "#06d6a0", "#118ab2", "#f78c6b", "#b388eb"];
+      const soundNames = ["cat", "dog", "trumpet", "piano", "bell", "drum", "flute"];
+      const noteSteps = [0, 2, 4, 7, 9, 12, 14, 16];
+
+      let width = 1;
+      let height = 1;
+      let dpr = 1;
+      let audio;
+      let masterGain;
+      let noiseBuffer;
+      let lastFrame = performance.now();
+      let nextMelonAt = performance.now() + 2600;
+      let idlePulse = 0;
+      let audioReady = false;
+
+      const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+      const random = (min, max) => min + Math.random() * (max - min);
+      const pick = (items) => items[Math.floor(Math.random() * items.length)];
+      const pointerList = () => Array.from(activePointers.values());
+
+      function resize() {
+        dpr = Math.min(window.devicePixelRatio || 1, DPR_LIMIT);
+        width = Math.max(1, Math.floor(window.innerWidth));
+        height = Math.max(1, Math.floor(window.innerHeight));
+        canvas.width = Math.floor(width * dpr);
+        canvas.height = Math.floor(height * dpr);
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      }
+
+      function ensureAudio() {
+        if (!audio) {
+          const AudioContext = window.AudioContext || window.webkitAudioContext;
+          audio = new AudioContext();
+          masterGain = audio.createGain();
+          masterGain.gain.value = 0.72;
+          masterGain.connect(audio.destination);
+          noiseBuffer = makeNoiseBuffer(1.2);
+        }
+
+        if (audio.state === "suspended") {
+          audio.resume();
+        }
+
+        if (!audioReady) {
+          audioReady = true;
+          playSparkle(audio.currentTime, 440, 0.09);
+        }
+      }
+
+      function makeNoiseBuffer(seconds) {
+        const length = Math.max(1, Math.floor(audio.sampleRate * seconds));
+        const buffer = audio.createBuffer(1, length, audio.sampleRate);
+        const data = buffer.getChannelData(0);
+        for (let i = 0; i < length; i += 1) {
+          data[i] = Math.random() * 2 - 1;
+        }
+        return buffer;
+      }
+
+      function envGain(start, peak, attack, release, endLevel = 0.0001) {
+        const gain = audio.createGain();
+        const param = gain.gain;
+        param.cancelScheduledValues(start);
+        param.setValueAtTime(0.0001, start);
+        param.exponentialRampToValueAtTime(Math.max(0.0002, peak), start + attack);
+        param.exponentialRampToValueAtTime(endLevel, start + attack + release);
+        return gain;
+      }
+
+      function getControlValues() {
+        const points = pointerList();
+        if (!points.length) {
+          return { count: 0, avgX: width / 2, avgY: height / 2, bpm: 110, pitch: 1, base: 330 };
+        }
+
+        const avgX = points.reduce((sum, p) => sum + p.x, 0) / points.length;
+        const avgY = points.reduce((sum, p) => sum + p.y, 0) / points.length;
+        const xNorm = clamp(avgX / Math.max(1, width), 0, 1);
+        const yNorm = clamp(avgY / Math.max(1, height), 0, 1);
+        const bpm = 55 + xNorm * 215;
+        const pitch = 0.56 + (1 - yNorm) * 1.9;
+        const step = noteSteps[Math.min(noteSteps.length - 1, points.length - 1)];
+        const base = 196 * pitch * Math.pow(2, step / 12);
+        return { count: points.length, avgX, avgY, bpm, pitch, base };
+      }
+
+      function soundTypeForCount(count) {
+        if (count <= 0) return "bell";
+        return soundNames[(count - 1) % soundNames.length];
+      }
+
+      function schedulePointerLoop(pointerId) {
+        if (!activePointers.has(pointerId) || !audio) return;
+
+        const control = getControlValues();
+        const type = soundTypeForCount(control.count);
+        const pointer = activePointers.get(pointerId);
+        if (!pointer) return;
+
+        const spread = (pointer.x / Math.max(1, width) - 0.5) * 0.34;
+        const semitone = noteSteps[(pointer.noteIndex + control.count) % noteSteps.length];
+        const freq = clamp(control.base * Math.pow(2, semitone / 12), 75, 1800);
+        const now = audio.currentTime;
+        playSound(type, now, freq, spread, pointer.color, pointer);
+        makeTapVisual(pointer, type);
+
+        const delay = clamp(60000 / control.bpm, 135, 1120);
+        const existing = soundLoops.get(pointerId);
+        if (existing) {
+          clearTimeout(existing);
+        }
+        soundLoops.set(pointerId, window.setTimeout(() => schedulePointerLoop(pointerId), delay));
+      }
+
+      function playSound(type, start, freq, pan, color, pointer) {
+        if (type === "cat") playMeow(start, freq, pan);
+        else if (type === "dog") playBark(start, freq, pan);
+        else if (type === "trumpet") playTrumpet(start, freq, pan);
+        else if (type === "piano") playPiano(start, freq, pan);
+        else if (type === "bell") playBell(start, freq, pan);
+        else if (type === "drum") playDrum(start, freq, pan);
+        else playFlute(start, freq, pan);
+
+        notes.push({
+          x: pointer.x,
+          y: pointer.y,
+          text: symbolFor(type),
+          color,
+          size: random(24, 42),
+          life: 1,
+          vy: random(-70, -42),
+          wobble: random(-1, 1)
+        });
+      }
+
+      function panNode(pan) {
+        const panner = audio.createStereoPanner ? audio.createStereoPanner() : null;
+        if (panner) {
+          panner.pan.value = clamp(pan, -0.85, 0.85);
+          return panner;
+        }
+        return masterGain;
+      }
+
+      function connectWithPan(source, gain, pan) {
+        const panner = panNode(pan);
+        source.connect(gain);
+        if (panner === masterGain) {
+          gain.connect(masterGain);
+        } else {
+          gain.connect(panner);
+          panner.connect(masterGain);
+        }
+      }
+
+      function playMeow(start, freq, pan) {
+        const osc = audio.createOscillator();
+        const filter = audio.createBiquadFilter();
+        const gain = envGain(start, 0.2, 0.028, 0.38);
+        osc.type = "triangle";
+        osc.frequency.setValueAtTime(freq * 1.62, start);
+        osc.frequency.exponentialRampToValueAtTime(Math.max(80, freq * 0.72), start + 0.36);
+        filter.type = "bandpass";
+        filter.frequency.setValueAtTime(freq * 2.25, start);
+        filter.Q.value = 7;
+        osc.connect(filter);
+        const panner = panNode(pan);
+        filter.connect(gain);
+        gain.connect(panner);
+        panner.connect(masterGain);
+        osc.start(start);
+        osc.stop(start + 0.46);
+      }
+
+      function playBark(start, freq, pan) {
+        const barkNoise = audio.createBufferSource();
+        const filter = audio.createBiquadFilter();
+        const gain = envGain(start, 0.24, 0.008, 0.16);
+        barkNoise.buffer = noiseBuffer;
+        filter.type = "bandpass";
+        filter.frequency.value = clamp(freq * 2.4, 260, 1200);
+        filter.Q.value = 4;
+        barkNoise.connect(filter);
+        const panner = panNode(pan);
+        filter.connect(gain);
+        gain.connect(panner);
+        panner.connect(masterGain);
+        barkNoise.start(start);
+        barkNoise.stop(start + 0.2);
+
+        const osc = audio.createOscillator();
+        const body = envGain(start + 0.015, 0.18, 0.006, 0.13);
+        osc.type = "square";
+        osc.frequency.setValueAtTime(clamp(freq * 0.42, 80, 230), start);
+        connectWithPan(osc, body, pan * 0.7);
+        osc.start(start);
+        osc.stop(start + 0.18);
+      }
+
+      function playTrumpet(start, freq, pan) {
+        const gain = envGain(start, 0.17, 0.035, 0.28);
+        const filter = audio.createBiquadFilter();
+        filter.type = "bandpass";
+        filter.frequency.setValueAtTime(freq * 2.3, start);
+        filter.frequency.linearRampToValueAtTime(freq * 3.1, start + 0.2);
+        filter.Q.value = 6;
+        const panner = panNode(pan);
+        filter.connect(gain);
+        gain.connect(panner);
+        panner.connect(masterGain);
+
+        [1, 1.01, 2.01].forEach((ratio, i) => {
+          const osc = audio.createOscillator();
+          osc.type = i === 2 ? "square" : "sawtooth";
+          osc.frequency.setValueAtTime(freq * ratio, start);
+          osc.frequency.linearRampToValueAtTime(freq * ratio * 1.02, start + 0.22);
+          osc.connect(filter);
+          osc.start(start);
+          osc.stop(start + 0.36);
+        });
+      }
+
+      function playPiano(start, freq, pan) {
+        [1, 2, 3.01].forEach((ratio, i) => {
+          const osc = audio.createOscillator();
+          const gain = envGain(start, i === 0 ? 0.21 : 0.07, 0.006, i === 0 ? 0.55 : 0.32);
+          osc.type = i === 0 ? "triangle" : "sine";
+          osc.frequency.setValueAtTime(freq * ratio, start);
+          connectWithPan(osc, gain, pan);
+          osc.start(start);
+          osc.stop(start + 0.72);
+        });
+      }
+
+      function playBell(start, freq, pan) {
+        [1, 2.41, 3.02].forEach((ratio, i) => {
+          const osc = audio.createOscillator();
+          const gain = envGain(start, i === 0 ? 0.14 : 0.055, 0.005, 0.82);
+          osc.type = "sine";
+          osc.frequency.setValueAtTime(freq * ratio, start);
+          connectWithPan(osc, gain, pan);
+          osc.start(start);
+          osc.stop(start + 1.0);
+        });
+      }
+
+      function playDrum(start, freq, pan) {
+        const osc = audio.createOscillator();
+        const gain = envGain(start, 0.31, 0.004, 0.19);
+        osc.type = "sine";
+        osc.frequency.setValueAtTime(clamp(freq * 0.56, 70, 180), start);
+        osc.frequency.exponentialRampToValueAtTime(44, start + 0.18);
+        connectWithPan(osc, gain, pan);
+        osc.start(start);
+        osc.stop(start + 0.23);
+
+        const hit = audio.createBufferSource();
+        const noiseGain = envGain(start, 0.08, 0.002, 0.08);
+        hit.buffer = noiseBuffer;
+        connectWithPan(hit, noiseGain, pan);
+        hit.start(start);
+        hit.stop(start + 0.09);
+      }
+
+      function playFlute(start, freq, pan) {
+        const osc = audio.createOscillator();
+        const gain = envGain(start, 0.12, 0.07, 0.36);
+        const filter = audio.createBiquadFilter();
+        osc.type = "sine";
+        osc.frequency.setValueAtTime(freq, start);
+        osc.frequency.linearRampToValueAtTime(freq * 1.03, start + 0.28);
+        filter.type = "lowpass";
+        filter.frequency.value = 1700;
+        osc.connect(filter);
+        const panner = panNode(pan);
+        filter.connect(gain);
+        gain.connect(panner);
+        panner.connect(masterGain);
+        osc.start(start);
+        osc.stop(start + 0.52);
+      }
+
+      function playSparkle(start, freq, length) {
+        [0, 0.08, 0.15].forEach((offset, i) => {
+          const osc = audio.createOscillator();
+          const gain = envGain(start + offset, 0.07, 0.006, length + i * 0.03);
+          osc.type = "sine";
+          osc.frequency.value = freq * [1, 1.5, 2][i];
+          connectWithPan(osc, gain, random(-0.3, 0.3));
+          osc.start(start + offset);
+          osc.stop(start + offset + length + 0.22);
+        });
+      }
+
+      function playFanfare() {
+        if (!audio) return;
+        const now = audio.currentTime;
+        const freqs = [392, 523.25, 659.25, 783.99, 1046.5];
+        freqs.forEach((freq, i) => {
+          const at = now + i * 0.13;
+          playTrumpet(at, freq, (i - 2) * 0.18);
+          if (i > 1) playBell(at + 0.035, freq * 1.5, (2 - i) * 0.15);
+        });
+      }
+
+      function symbolFor(type) {
+        return {
+          cat: "miau",
+          dog: "wan",
+          trumpet: "pa",
+          piano: "pon",
+          bell: "lin",
+          drum: "don",
+          flute: "fu"
+        }[type] || "la";
+      }
+
+      function makeTapVisual(pointer, type) {
+        const color = pointer.color;
+        ripples.push({
+          x: pointer.x,
+          y: pointer.y,
+          radius: 12,
+          max: random(74, 128),
+          life: 1,
+          color
+        });
+
+        const count = type === "drum" ? 4 : 2;
+        for (let i = 0; i < count; i += 1) {
+          bubbles.push({
+            x: pointer.x + random(-14, 14),
+            y: pointer.y + random(-14, 14),
+            vx: random(-48, 48),
+            vy: random(-95, -35),
+            radius: random(6, 15),
+            color: pick(colors),
+            life: 1
+          });
+        }
+      }
+
+      function addPointer(event) {
+        ensureAudio();
+        const rect = canvas.getBoundingClientRect();
+        const pointer = {
+          id: event.pointerId,
+          x: event.clientX - rect.left,
+          y: event.clientY - rect.top,
+          color: colors[activePointers.size % colors.length],
+          noteIndex: Math.floor(random(0, noteSteps.length)),
+          born: performance.now()
+        };
+        activePointers.set(event.pointerId, pointer);
+        canvas.setPointerCapture?.(event.pointerId);
+        makeTapVisual(pointer, soundTypeForCount(activePointers.size));
+        schedulePointerLoop(event.pointerId);
+        checkMelonHit(pointer.x, pointer.y);
+      }
+
+      function movePointer(event) {
+        const pointer = activePointers.get(event.pointerId);
+        if (!pointer) return;
+        const rect = canvas.getBoundingClientRect();
+        pointer.x = clamp(event.clientX - rect.left, 0, width);
+        pointer.y = clamp(event.clientY - rect.top, 0, height);
+        if (Math.random() < 0.34) {
+          bubbles.push({
+            x: pointer.x,
+            y: pointer.y,
+            vx: random(-22, 22),
+            vy: random(-38, 8),
+            radius: random(4, 10),
+            color: pointer.color,
+            life: 0.65
+          });
+        }
+        checkMelonHit(pointer.x, pointer.y);
+      }
+
+      function removePointer(event) {
+        activePointers.delete(event.pointerId);
+        const timeout = soundLoops.get(event.pointerId);
+        if (timeout) {
+          clearTimeout(timeout);
+          soundLoops.delete(event.pointerId);
+        }
+      }
+
+      function spawnMelon() {
+        const radius = random(34, 54);
+        const fromLeft = Math.random() > 0.5;
+        const y = random(height * 0.18, height * 0.76);
+        rollingMelons.push({
+          x: fromLeft ? -radius * 2 : width + radius * 2,
+          y,
+          radius,
+          vx: (fromLeft ? 1 : -1) * random(85, 160),
+          vy: random(-18, 18),
+          spin: fromLeft ? 0 : Math.PI,
+          hit: false
+        });
+        nextMelonAt = performance.now() + random(6500, 11500);
+      }
+
+      function checkMelonHit(x, y) {
+        for (const melon of rollingMelons) {
+          if (melon.hit) continue;
+          const distance = Math.hypot(melon.x - x, melon.y - y);
+          if (distance < melon.radius + 38) {
+            burstMelon(melon);
+            break;
+          }
+        }
+      }
+
+      function burstMelon(melon) {
+        melon.hit = true;
+        playFanfare();
+        for (let i = 0; i < 46; i += 1) {
+          const angle = (i / 46) * TAU + random(-0.08, 0.08);
+          const speed = random(110, 360);
+          stars.push({
+            x: melon.x,
+            y: melon.y,
+            vx: Math.cos(angle) * speed,
+            vy: Math.sin(angle) * speed - random(30, 130),
+            size: random(8, 22),
+            life: random(0.7, 1.25),
+            color: pick(["#ffe66f", "#ffffff", "#ff6f91", "#06d6a0"])
+          });
+        }
+
+        for (let i = 0; i < 26; i += 1) {
+          confetti.push({
+            x: melon.x + random(-12, 12),
+            y: melon.y + random(-12, 12),
+            vx: random(-280, 280),
+            vy: random(-340, -80),
+            rot: random(0, TAU),
+            vr: random(-8, 8),
+            size: random(6, 16),
+            life: random(0.9, 1.5),
+            color: pick(["#006b3c", "#f7fff0", "#ff3b58", "#111827", "#5eead4"])
+          });
+        }
+
+        for (let i = 0; i < 5; i += 1) {
+          notes.push({
+            x: melon.x + random(-28, 28),
+            y: melon.y + random(-22, 22),
+            text: "ta-da",
+            color: pick(colors),
+            size: random(32, 50),
+            life: 1.1,
+            vy: random(-105, -66),
+            wobble: random(-2, 2)
+          });
+        }
+      }
+
+      function drawBackground(time) {
+        const grd = ctx.createLinearGradient(0, 0, 0, height);
+        grd.addColorStop(0, "#8fd6ff");
+        grd.addColorStop(0.54, "#c8f7e3");
+        grd.addColorStop(1, "#fff3a6");
+        ctx.fillStyle = grd;
+        ctx.fillRect(0, 0, width, height);
+
+        const sunX = width * 0.82;
+        const sunY = height * 0.16;
+        ctx.fillStyle = "#ffe66f";
+        ctx.beginPath();
+        ctx.arc(sunX, sunY, Math.max(34, Math.min(width, height) * 0.08), 0, TAU);
+        ctx.fill();
+
+        ctx.fillStyle = "rgba(255, 255, 255, 0.72)";
+        drawCloud(width * 0.18 + Math.sin(time * 0.00022) * 18, height * 0.15, 1.0);
+        drawCloud(width * 0.58 + Math.sin(time * 0.00018 + 2) * 24, height * 0.27, 0.75);
+
+        ctx.fillStyle = "#6ed48f";
+        ctx.beginPath();
+        ctx.ellipse(width * 0.18, height + 14, width * 0.38, height * 0.18, 0, Math.PI, TAU);
+        ctx.ellipse(width * 0.72, height + 20, width * 0.44, height * 0.21, 0, Math.PI, TAU);
+        ctx.fill();
+
+        idlePulse += 0.015;
+        const points = pointerList();
+        if (!points.length) {
+          ctx.save();
+          ctx.globalAlpha = 0.36 + Math.sin(idlePulse) * 0.12;
+          ctx.strokeStyle = "#ffffff";
+          ctx.lineWidth = 4;
+          ctx.beginPath();
+          ctx.arc(width / 2, height / 2, 42 + Math.sin(idlePulse) * 8, 0, TAU);
+          ctx.stroke();
+          ctx.restore();
+        }
+      }
+
+      function drawCloud(x, y, scale) {
+        ctx.beginPath();
+        ctx.arc(x - 32 * scale, y + 8 * scale, 23 * scale, 0, TAU);
+        ctx.arc(x, y, 34 * scale, 0, TAU);
+        ctx.arc(x + 38 * scale, y + 9 * scale, 25 * scale, 0, TAU);
+        ctx.roundRect(x - 58 * scale, y + 8 * scale, 116 * scale, 28 * scale, 14 * scale);
+        ctx.fill();
+      }
+
+      function drawPointerGlow(pointer, time) {
+        const age = (time - pointer.born) / 1000;
+        const pulse = 1 + Math.sin(age * 8) * 0.08;
+        ctx.save();
+        ctx.globalAlpha = 0.52;
+        ctx.fillStyle = pointer.color;
+        ctx.beginPath();
+        ctx.arc(pointer.x, pointer.y, 34 * pulse, 0, TAU);
+        ctx.fill();
+
+        ctx.globalAlpha = 0.95;
+        ctx.fillStyle = "#ffffff";
+        ctx.beginPath();
+        ctx.arc(pointer.x, pointer.y, 14 * pulse, 0, TAU);
+        ctx.fill();
+        ctx.restore();
+      }
+
+      function drawMelon(melon) {
+        ctx.save();
+        ctx.translate(melon.x, melon.y);
+        ctx.rotate(melon.spin);
+        ctx.fillStyle = "#0fb35e";
+        ctx.beginPath();
+        ctx.ellipse(0, 0, melon.radius * 1.16, melon.radius, 0, 0, TAU);
+        ctx.fill();
+        ctx.strokeStyle = "#0a7f45";
+        ctx.lineWidth = Math.max(3, melon.radius * 0.12);
+        for (let i = -2; i <= 2; i += 1) {
+          ctx.beginPath();
+          ctx.ellipse(i * melon.radius * 0.24, 0, melon.radius * 0.15, melon.radius * 0.95, 0, 0, TAU);
+          ctx.stroke();
+        }
+        ctx.fillStyle = "#14452f";
+        ctx.beginPath();
+        ctx.arc(-melon.radius * 0.26, -melon.radius * 0.18, melon.radius * 0.08, 0, TAU);
+        ctx.arc(melon.radius * 0.28, -melon.radius * 0.15, melon.radius * 0.08, 0, TAU);
+        ctx.fill();
+        ctx.strokeStyle = "#14452f";
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.arc(0, melon.radius * 0.02, melon.radius * 0.3, 0.15, Math.PI - 0.15);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      function drawStar(x, y, radius, color, rotation) {
+        ctx.save();
+        ctx.translate(x, y);
+        ctx.rotate(rotation);
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        for (let i = 0; i < 10; i += 1) {
+          const r = i % 2 === 0 ? radius : radius * 0.46;
+          const a = -Math.PI / 2 + (i / 10) * TAU;
+          ctx.lineTo(Math.cos(a) * r, Math.sin(a) * r);
+        }
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+      }
+
+      function updateParticles(list, dt, update, draw) {
+        for (let i = list.length - 1; i >= 0; i -= 1) {
+          const item = list[i];
+          update(item, dt);
+          draw(item);
+          if (item.life <= 0) {
+            list.splice(i, 1);
+          }
+        }
+      }
+
+      function animate(time) {
+        const dt = Math.min(0.033, (time - lastFrame) / 1000 || 0.016);
+        lastFrame = time;
+
+        drawBackground(time);
+
+        if (time > nextMelonAt && rollingMelons.length < 2) {
+          spawnMelon();
+        }
+
+        for (let i = rollingMelons.length - 1; i >= 0; i -= 1) {
+          const melon = rollingMelons[i];
+          if (melon.hit) {
+            rollingMelons.splice(i, 1);
+            continue;
+          }
+          melon.x += melon.vx * dt;
+          melon.y += Math.sin(time * 0.003 + i) * 8 * dt + melon.vy * dt;
+          melon.spin += (melon.vx / Math.max(1, melon.radius)) * dt;
+          drawMelon(melon);
+
+          if (melon.x < -melon.radius * 3 || melon.x > width + melon.radius * 3) {
+            rollingMelons.splice(i, 1);
+          }
+        }
+
+        updateParticles(ripples, dt, (r) => {
+          r.radius += (r.max - r.radius) * Math.min(1, dt * 4.8);
+          r.life -= dt * 1.45;
+        }, (r) => {
+          ctx.save();
+          ctx.globalAlpha = Math.max(0, r.life) * 0.38;
+          ctx.strokeStyle = r.color;
+          ctx.lineWidth = 8;
+          ctx.beginPath();
+          ctx.arc(r.x, r.y, r.radius, 0, TAU);
+          ctx.stroke();
+          ctx.restore();
+        });
+
+        updateParticles(bubbles, dt, (b) => {
+          b.x += b.vx * dt;
+          b.y += b.vy * dt;
+          b.vy += 90 * dt;
+          b.life -= dt * 1.1;
+        }, (b) => {
+          ctx.save();
+          ctx.globalAlpha = Math.max(0, b.life) * 0.68;
+          ctx.fillStyle = b.color;
+          ctx.beginPath();
+          ctx.arc(b.x, b.y, b.radius, 0, TAU);
+          ctx.fill();
+          ctx.restore();
+        });
+
+        updateParticles(stars, dt, (s) => {
+          s.x += s.vx * dt;
+          s.y += s.vy * dt;
+          s.vy += 240 * dt;
+          s.life -= dt;
+        }, (s) => {
+          ctx.save();
+          ctx.globalAlpha = Math.max(0, s.life);
+          drawStar(s.x, s.y, s.size, s.color, time * 0.006 + s.x);
+          ctx.restore();
+        });
+
+        updateParticles(confetti, dt, (c) => {
+          c.x += c.vx * dt;
+          c.y += c.vy * dt;
+          c.vy += 320 * dt;
+          c.rot += c.vr * dt;
+          c.life -= dt;
+        }, (c) => {
+          ctx.save();
+          ctx.globalAlpha = Math.max(0, c.life);
+          ctx.translate(c.x, c.y);
+          ctx.rotate(c.rot);
+          ctx.fillStyle = c.color;
+          ctx.fillRect(-c.size / 2, -c.size / 4, c.size, c.size / 2);
+          ctx.restore();
+        });
+
+        for (const pointer of pointerList()) {
+          drawPointerGlow(pointer, time);
+        }
+
+        updateParticles(notes, dt, (n) => {
+          n.y += n.vy * dt;
+          n.x += Math.sin(time * 0.004) * n.wobble;
+          n.life -= dt * 0.82;
+        }, (n) => {
+          ctx.save();
+          ctx.globalAlpha = Math.max(0, n.life);
+          ctx.fillStyle = n.color;
+          ctx.font = `700 ${n.size}px system-ui, sans-serif`;
+          ctx.textAlign = "center";
+          ctx.textBaseline = "middle";
+          ctx.lineWidth = Math.max(3, n.size * 0.1);
+          ctx.strokeStyle = "rgba(255,255,255,0.9)";
+          ctx.strokeText(n.text, n.x, n.y);
+          ctx.fillText(n.text, n.x, n.y);
+          ctx.restore();
+        });
+
+        requestAnimationFrame(animate);
+      }
+
+      canvas.addEventListener("pointerdown", (event) => {
+        event.preventDefault();
+        addPointer(event);
+      }, { passive: false });
+
+      canvas.addEventListener("pointermove", (event) => {
+        event.preventDefault();
+        movePointer(event);
+      }, { passive: false });
+
+      canvas.addEventListener("pointerup", removePointer);
+      canvas.addEventListener("pointercancel", removePointer);
+      canvas.addEventListener("lostpointercapture", removePointer);
+
+      window.addEventListener("resize", resize);
+      window.addEventListener("orientationchange", () => setTimeout(resize, 120));
+
+      resize();
+      requestAnimationFrame(animate);
+
+      if ("serviceWorker" in navigator) {
+        window.addEventListener("load", () => {
+          navigator.serviceWorker.register("./service-worker.js").catch(() => {});
+        });
+      }
+    })();
+  </script>
+</body>
+</html>
